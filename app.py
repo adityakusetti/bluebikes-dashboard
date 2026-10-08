@@ -1,8 +1,11 @@
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
 
-st.set_page_config(page_title="Bluebikes Live", page_icon="🚲", layout="wide",
+st.set_page_config(page_title="Bluebikes Live", page_icon=":material/pedal_bike:", layout="wide",
                    initial_sidebar_state="expanded")
 TZ = "America/New_York"
 ACCENT = "#4FC3F7"
@@ -29,6 +32,12 @@ st.markdown(
     .legend {font-size: 0.8rem; opacity: 0.8; margin-top: 6px;}
     .dot {display:inline-block; width:9px; height:9px; border-radius:50%; margin: 0 4px 0 12px;}
     hr {border-color: #14304d;}
+    .sdot {display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:7px;}
+    .ramp {height:8px; border-radius:4px; width:220px; margin: 4px 0 2px 0;
+           background: linear-gradient(90deg, #EF5350 0%, #F2C94C 50%, #4FC3F7 100%);}
+    .ramp-labels {display:flex; justify-content:space-between; width:220px; font-size:0.72rem; opacity:0.7;}
+    .legend-row {display:flex; gap:28px; align-items:flex-end; margin-top:8px; flex-wrap:wrap;}
+    .legend-title {font-size:0.75rem; opacity:0.7; margin-bottom:2px;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -74,13 +83,13 @@ with st.sidebar:
     st.divider()
     age = meta.age_min
     if age is None or pd.isna(age):
-        pill = "No data"
+        pill = '<span class="sdot" style="background:#6B7280"></span>No data'
     elif age <= 15:
-        pill = f"🟢 Live · {age:.0f} min ago"
+        pill = f'<span class="sdot" style="background:#4ADE80"></span>Live · {age:.0f} min ago'
     elif age <= 60:
-        pill = f"🟡 Delayed · {age:.0f} min ago"
+        pill = f'<span class="sdot" style="background:#F2C94C"></span>Delayed · {age:.0f} min ago'
     else:
-        pill = f"🔴 Stale · {age / 60:.1f} h ago"
+        pill = f'<span class="sdot" style="background:#EF5350"></span>Stale · {age / 60:.1f} h ago'
     st.markdown(f'<span class="pill">{pill}</span>', unsafe_allow_html=True)
     st.caption(f"Collecting since {pd.to_datetime(meta.first_snapshot).strftime('%b %d, %Y')}")
     st.caption(f"{int(meta.total_rows):,} rows · {int(meta.snapshots):,} snapshots")
@@ -116,16 +125,16 @@ if page == "Home":
         c.metric("Empty stations", f"{int((latest.bikes == 0).sum()):,}")
         d.metric("Full stations", f"{int((latest.docks == 0).sum()):,}")
 
-        st.subheader("Typical bikes by hour")
-        by_hour = q(f"""
-            with t as (select fetched_at, sum(num_bikes_available) as bikes
-                       from dock_status group by fetched_at)
-            select extract(hour from fetched_at at time zone '{TZ}')::int as hour,
-                   round(avg(bikes)) as avg_bikes
-            from t group by 1 order by 1
+        st.subheader("Last 24 hours")
+        net = q(f"""
+            select fetched_at at time zone '{TZ}' as time,
+                   sum(num_bikes_available) as bikes, sum(num_docks_available) as docks
+            from dock_status where fetched_at >= now() - interval '1 day'
+            group by fetched_at order by fetched_at
         """)
-        st.bar_chart(by_hour.set_index("hour").avg_bikes, color=ACCENT, height=220)
-        st.caption("Network-wide average, Boston time.")
+        if len(net):
+            st.line_chart(net.set_index("time")[["bikes", "docks"]], color=[ACCENT, AMBER], height=220)
+        st.caption("Bikes vs docks available across the whole network. Gaps mean the collector was offline.")
 
         st.subheader("Emptiest stations now")
         emptiest = latest[latest.bikes == 0][["name", "docks"]].head(8)
@@ -141,29 +150,62 @@ if page == "Home":
         m["lon"] = pd.to_numeric(m.lon, errors="coerce")
         m = m.dropna(subset=["lat", "lon"])
         if len(m):
-            def color(r):
-                if r.bikes == 0:
-                    return [239, 83, 80, 210]
-                if r.docks == 0:
-                    return [242, 201, 76, 210]
-                return [79, 195, 247, 210]
+            def ramp(r):
+                total = r.bikes + r.docks
+                if total <= 0:
+                    return [107, 114, 128, 200]          # offline / no data
+                f = r.bikes / total                       # share of the station that is bikes
+                if f <= 0.5:
+                    t = f / 0.5                           # red -> amber
+                    c0, c1 = (239, 83, 80), (242, 201, 76)
+                else:
+                    t = (f - 0.5) / 0.5                   # amber -> blue
+                    c0, c1 = (242, 201, 76), (79, 195, 247)
+                return [int(c0[i] + (c1[i] - c0[i]) * t) for i in range(3)] + [235]
 
-            m["color"] = m.apply(color, axis=1)
-            layer = pdk.Layer(
+            m["color"] = m.apply(ramp, axis=1)
+            m["halo"] = m.color.apply(lambda c: c[:3] + [55])
+            m["size"] = (m.bikes + m.docks).clip(lower=8)
+            m["bikes"] = m.bikes.astype(int)
+            m["docks"] = m.docks.astype(int)
+            m["capacity"] = (m.bikes + m.docks).astype(int)
+
+            halo = pdk.Layer(
                 "ScatterplotLayer", data=m, get_position="[lon, lat]",
-                get_fill_color="color", get_radius=55, pickable=True,
-                radius_min_pixels=3, radius_max_pixels=11,
+                get_fill_color="halo", get_radius="size * 5",
+                radius_min_pixels=7, radius_max_pixels=26, pickable=False,
             )
-            view = pdk.ViewState(latitude=float(m.lat.mean()), longitude=float(m.lon.mean()), zoom=11.3)
+            core = pdk.Layer(
+                "ScatterplotLayer", data=m, get_position="[lon, lat]",
+                get_fill_color="color", get_line_color=[8, 25, 43, 255],
+                stroked=True, line_width_min_pixels=1.5, get_radius="size * 2.4",
+                radius_min_pixels=4, radius_max_pixels=14, pickable=True,
+            )
+            view = pdk.ViewState(latitude=float(m.lat.mean()), longitude=float(m.lon.mean()),
+                                 zoom=11.4, pitch=0)
             st.pydeck_chart(
-                pdk.Deck(layers=[layer], initial_view_state=view, map_style=MAP_STYLE,
-                         tooltip={"text": "{name}\nBikes: {bikes}\nDocks: {docks}"}),
+                pdk.Deck(
+                    layers=[halo, core], initial_view_state=view, map_style=MAP_STYLE,
+                    tooltip={
+                        "html": "<div style='font-weight:600;margin-bottom:4px'>{name}</div>"
+                                "<div>Bikes <b>{bikes}</b> &nbsp;·&nbsp; Docks <b>{docks}</b></div>"
+                                "<div style='opacity:.7'>{capacity} total</div>",
+                        "style": {"backgroundColor": "#0B2239", "color": "#E6F1FA",
+                                  "border": "1px solid #1d4468", "borderRadius": "8px",
+                                  "padding": "8px 10px", "fontSize": "12px"},
+                    },
+                ),
                 height=640,
             )
             st.markdown(
-                '<div class="legend"><span class="dot" style="background:#4FC3F7"></span>Bikes and docks available'
-                '<span class="dot" style="background:#EF5350"></span>Empty'
-                '<span class="dot" style="background:#F2C94C"></span>Full</div>',
+                '<div class="legend-row">'
+                '<div><div class="legend-title">Availability</div><div class="ramp"></div>'
+                '<div class="ramp-labels"><span>No bikes</span><span>Balanced</span><span>No docks free</span></div></div>'
+                '<div><div class="legend-title">Dot size</div><div style="font-size:0.78rem;opacity:.8">'
+                'Larger = more docks at the station</div></div>'
+                '<div><div class="legend-title">Grey</div><div style="font-size:0.78rem;opacity:.8">'
+                'Reporting no bikes or docks</div></div>'
+                '</div>',
                 unsafe_allow_html=True,
             )
         else:
@@ -209,46 +251,171 @@ else:
             order by 2
         """)
         stations["label"] = stations.name.fillna(stations.station_id)
+        labels = stations.label.tolist()
+        sid_of = lambda label: stations.loc[stations.label == label, "station_id"].iloc[0]
+        today = datetime.now(ZoneInfo(TZ)).date()
+
+        # ---------- whole-day view ----------
+        st.subheader("Station day view")
         c1, c2 = st.columns([3, 2])
-        pick = c1.selectbox("Choose a station", stations.label.tolist())
-        days_back = c2.slider("Days to show", 1, 30, 7)
-        sid = stations.loc[stations.label == pick, "station_id"].iloc[0]
+        pick = c1.selectbox("Station", labels, key="day_station")
+        day = c2.date_input("Day", value=today, key="day_date")
+        sid = sid_of(pick)
+
+        stats = q("""
+            select count(*) as readings,
+                   round(100 * avg((num_bikes_available = 0)::int)::numeric, 1) as pct_empty,
+                   round(100 * avg((num_docks_available = 0)::int)::numeric, 1) as pct_full
+            from dock_status where station_id = :sid
+        """, sid=sid).iloc[0]
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Readings (all time)", f"{int(stats.readings):,}")
+        k2.metric("Time empty", f"{stats.pct_empty}%")
+        k3.metric("Time full", f"{stats.pct_full}%")
+
+        # ---------- estimated rides on the chosen day ----------
+        rides = q(f"""
+            with s as (
+                select station_id, fetched_at, num_bikes_available as bikes,
+                       lag(num_bikes_available) over (partition by station_id order by fetched_at) as prev
+                from dock_status
+                where (fetched_at at time zone '{TZ}')::date = :day)
+            select coalesce(sum(greatest(prev - bikes, 0)), 0) as net_out,
+                   coalesce(sum(greatest(prev - bikes, 0)) filter (where station_id = :sid), 0) as st_out,
+                   coalesce(sum(greatest(bikes - prev, 0)) filter (where station_id = :sid), 0) as st_in,
+                   count(distinct fetched_at) as snapshots
+            from s where prev is not null
+        """, sid=sid, day=day).iloc[0]
+        r1c, r2c, r3c, r4c = st.columns(4)
+        r1c.metric(f"Est. checkouts, {day:%b %d}", f"{int(rides.st_out):,}", help="Bikes taken from this station")
+        r2c.metric(f"Est. returns, {day:%b %d}", f"{int(rides.st_in):,}", help="Bikes returned to this station")
+        r3c.metric("Est. network rides that day", f"{int(rides.net_out):,}")
+        r4c.metric("Snapshots that day", f"{int(rides.snapshots):,}")
+        st.caption(
+            "These are lower-bound estimates from changes in bikes available between snapshots, not "
+            "official trip counts. Rides that start and end between two snapshots cancel out, so days "
+            "with few snapshots undercount heavily (a full 5-minute day has 288)."
+        )
+        if int(rides.snapshots) < 100:
+            st.warning("Few snapshots on this day, so the ride estimates are very low compared with reality.")
 
         ts = q(f"""
             select fetched_at at time zone '{TZ}' as time,
                    num_bikes_available as bikes, num_docks_available as docks
             from dock_status
-            where station_id = :sid and fetched_at >= now() - make_interval(days => :days)
+            where station_id = :sid and (fetched_at at time zone '{TZ}')::date = :day
             order by fetched_at
-        """, sid=sid, days=days_back)
-        stats = q("""
-            select count(*) as readings,
-                   round(avg(num_bikes_available)::numeric, 1) as avg_bikes,
-                   round(100 * avg((num_bikes_available = 0)::int)::numeric, 1) as pct_empty,
-                   round(100 * avg((num_docks_available = 0)::int)::numeric, 1) as pct_full
-            from dock_status where station_id = :sid
-        """, sid=sid).iloc[0]
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Readings", f"{int(stats.readings):,}")
-        k2.metric("Avg bikes", stats.avg_bikes)
-        k3.metric("Time empty", f"{stats.pct_empty}%")
-        k4.metric("Time full", f"{stats.pct_full}%")
-
+        """, sid=sid, day=day)
         if len(ts):
-            st.subheader("Bikes and docks over time")
             st.line_chart(ts.set_index("time")[["bikes", "docks"]], color=[ACCENT, AMBER])
+            st.caption(f"{len(ts)} readings on {day:%b %d}, Boston time. Straight stretches mean the "
+                       "collector was offline or ran less often.")
         else:
-            st.info("No readings for this station in the selected window.")
+            st.info("No readings for this station on that day.")
 
-        hourly = q(f"""
-            select extract(hour from fetched_at at time zone '{TZ}')::int as hour,
-                   round(avg(num_bikes_available)::numeric, 1) as avg_bikes,
-                   round(avg(num_docks_available)::numeric, 1) as avg_docks
-            from dock_status where station_id = :sid group by 1 order by 1
-        """, sid=sid)
-        st.subheader("Typical availability by hour")
-        st.line_chart(hourly.set_index("hour")[["avg_bikes", "avg_docks"]], color=[ACCENT, AMBER])
+        # ---------- every station on the chosen day ----------
+        st.subheader(f"Every station, {day:%b %d}")
+        nm = f"st.{SC['name']}" if SC["name"] else "x.station_id"
+        per_station = q(f"""
+            with x as (
+                select station_id, fetched_at, num_bikes_available as bikes,
+                       lag(num_bikes_available) over (partition by station_id order by fetched_at) as prev
+                from dock_status
+                where (fetched_at at time zone '{TZ}')::date = :day)
+            select {nm} as station,
+                   sum(greatest(prev - bikes, 0)) as est_checkouts,
+                   sum(greatest(bikes - prev, 0)) as est_returns,
+                   count(*) as readings
+            from x left join stations st on st.station_id = x.station_id
+            where prev is not null
+            group by 1
+            order by est_checkouts desc
+        """, day=day)
+        if len(per_station):
+            top = per_station.head(15).set_index("station")[["est_checkouts", "est_returns"]]
+            st.write("Top 15 stations by estimated checkouts")
+            st.bar_chart(top, color=[ACCENT, AMBER], horizontal=True, height=420)
+            st.dataframe(
+                per_station.rename(columns={"station": "Station", "est_checkouts": "Est. checkouts",
+                                            "est_returns": "Est. returns", "readings": "Readings"}),
+                hide_index=True, use_container_width=True, height=360)
+            st.caption("Lower-bound estimates, same method as above. Use the table's search and "
+                       "column sorting to find a station.")
+        else:
+            st.info("No data for that day.")
 
+        st.divider()
+
+        # ---------- trip planner ----------
+        st.subheader("Plan a trip")
+        st.caption(
+            "Shows what has usually been available at that station around that time, using readings "
+            "from the same kind of day (weekday or weekend) within 30 minutes either side. "
+            "This is a historical pattern, not a model forecast, and it gets more reliable as more "
+            "data is collected."
+        )
+
+        def profile(station_label, when_date, when_time, window_min=30):
+            weekend = when_date.isoweekday() >= 6
+            dow = ">= 6" if weekend else "<= 5"
+            minute = when_time.hour * 60 + when_time.minute
+            return q(f"""
+                select num_bikes_available as bikes, num_docks_available as docks
+                from dock_status
+                where station_id = :sid
+                  and extract(isodow from fetched_at at time zone '{TZ}') {dow}
+                  and abs(extract(hour from fetched_at at time zone '{TZ}') * 60
+                          + extract(minute from fetched_at at time zone '{TZ}') - :m) <= :w
+            """, sid=sid_of(station_label), m=minute, w=window_min)
+
+        def verdict(chance):
+            if chance >= 0.8:
+                return ":green[Likely]"
+            if chance >= 0.5:
+                return ":orange[Uncertain]"
+            return ":red[Unlikely]"
+
+        left_c, right_c = st.columns(2, gap="large")
+
+        with left_c:
+            st.markdown("**Pick up a bike**")
+            p_station = st.selectbox("From station", labels, key="pu_station")
+            p_date = st.date_input("Date", value=today, key="pu_date")
+            p_time = st.time_input("Time", value=time(8, 30), key="pu_time")
+            pdf = profile(p_station, p_date, p_time)
+            if len(pdf) == 0:
+                st.info("No readings for that station around that time yet.")
+            else:
+                bikes = pd.to_numeric(pdf.bikes, errors="coerce").dropna()
+                chance = float((bikes >= 1).mean())
+                m1, m2 = st.columns(2)
+                m1.metric("Typical bikes to take", f"{bikes.median():.0f}")
+                m2.metric("Usual range", f"{bikes.quantile(0.1):.0f} to {bikes.quantile(0.9):.0f}")
+                st.markdown(f"**{verdict(chance)}** that at least one bike is available "
+                            f"({chance * 100:.0f}% of {len(bikes)} readings).")
+                if len(bikes) < 10:
+                    st.caption("Few readings so far, so treat this as rough.")
+
+        with right_c:
+            st.markdown("**Park a bike**")
+            d_station = st.selectbox("At station", labels, key="dr_station")
+            d_date = st.date_input("Date", value=today, key="dr_date")
+            d_time = st.time_input("Arrival time", value=time(9, 0), key="dr_time")
+            ddf = profile(d_station, d_date, d_time)
+            if len(ddf) == 0:
+                st.info("No readings for that station around that time yet.")
+            else:
+                docks = pd.to_numeric(ddf.docks, errors="coerce").dropna()
+                chance = float((docks >= 1).mean())
+                m1, m2 = st.columns(2)
+                m1.metric("Typical free docks", f"{docks.median():.0f}")
+                m2.metric("Usual range", f"{docks.quantile(0.1):.0f} to {docks.quantile(0.9):.0f}")
+                st.markdown(f"**{verdict(chance)}** that at least one dock is free "
+                            f"({chance * 100:.0f}% of {len(docks)} readings).")
+                if len(docks) < 10:
+                    st.caption("Few readings so far, so treat this as rough.")
+
+        st.divider()
         st.subheader("Most often empty and full")
         ranks = q(f"""
             select {name_expr} as name,
