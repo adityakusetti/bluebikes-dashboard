@@ -79,7 +79,7 @@ with st.sidebar:
     st.markdown('<div class="brand">Bluebikes <span>Live</span></div>'
                 '<div class="tagline">Network availability and history</div>',
                 unsafe_allow_html=True)
-    page = st.radio("Navigate", ["Home", "History"], label_visibility="collapsed")
+    page = st.radio("Navigate", ["Home", "History", "Forecast"], label_visibility="collapsed")
     st.divider()
     age = meta.age_min
     if age is None or pd.isna(age):
@@ -214,7 +214,7 @@ if page == "Home":
 # =====================================================================
 # HISTORY
 # =====================================================================
-else:
+elif page == "History":
     st.title("History")
     st.caption("Estimated usage, station behaviour, and collection health over time.")
     tab1, tab2, tab3 = st.tabs(["Estimated rides", "Station explorer", "Collection health"])
@@ -521,3 +521,10 @@ else:
                 st.dataframe(gaps, hide_index=True, use_container_width=True)
             else:
                 st.success("No gaps over 15 minutes in this window.")
+
+# =====================================================================
+# FORECAST
+# =====================================================================
+else:
+    import forecast_page
+    forecast_page.render()
